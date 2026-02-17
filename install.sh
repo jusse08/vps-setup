@@ -545,7 +545,7 @@ run_sysctl_setup() {
 
     info "Применяю параметры..."
     APPLY_OUTPUT=$(sysctl --system 2>&1)
-    APPLY_ERRORS=$(echo "$APPLY_OUTPUT" | grep -i "error\|invalid\|unknown\|cannot" || true)
+    APPLY_ERRORS=$(echo "$APPLY_OUTPUT" | grep -i "error\|invalid\|unknown\|cannot" | grep -v "icmp_ignore_bogus_error_responses" || true)
 
     if [ -z "$APPLY_ERRORS" ]; then
         ok "Все параметры применены без ошибок"
@@ -610,67 +610,83 @@ run_sysctl_setup() {
 # =============================================================
 # Главное меню
 # =============================================================
-clear
-echo -e "${BOLD}"
-echo "  ┌─────────────────────────────────────────┐"
-echo "  │         VPS Setup Tool  v1.2            │"
-echo "  │  Первый запуск · Fail2ban · sysctl · WARP│"
-echo "  └─────────────────────────────────────────┘"
-echo -e "${NC}"
 
-section "Выбери действие"
-echo "  Что нужно сделать?"
-echo ""
-echo -e "  ${BOLD}1)${NC} Базовая настройка VPS   — пользователь, SSH, UFW"
-echo -e "  ${BOLD}2)${NC} Установка Fail2ban       — защита SSH от брутфорса"
-echo -e "  ${BOLD}3)${NC} sysctl: VPN нода         — Xray VLESS REALITY XTLS Vision"
-echo -e "  ${BOLD}4)${NC} sysctl: Remnawave панель — Docker + Caddy + PostgreSQL"
-echo -e "  ${BOLD}5)${NC} sysctl: Telegram бот     — Docker + веб страница + PostgreSQL"
-echo -e "  ${BOLD}6)${NC} Установка Remnanode      — Xray нода для Remnawave"
-echo -e "  ${BOLD}7)${NC} Установка Caddy Selfsteal — реверс-прокси для REALITY"
-echo -e "  ${BOLD}8)${NC} Установка WARP            — Cloudflare WARP туннель"
-echo ""
-read -rp "  Введи номер [1-8]: " CHOICE
+show_menu() {
+    clear
+    echo -e "${BOLD}"
+    echo "  ┌──────────────────────────────────────────────┐"
+    echo "  │           VPS Setup Tool  v1.2               │"
+    echo "  │  Первый запуск · Fail2ban · sysctl · WARP    │"
+    echo "  └──────────────────────────────────────────────┘"
+    echo -e "${NC}"
 
-case "$CHOICE" in
-    1)
-        run_initial_setup
-        ;;
-    2)
-        run_fail2ban_setup
-        ;;
-    3)
-        check_configs_dir
-        run_sysctl_setup 3 "VPN нода" "$CONFIGS_DIR/vpn-node.conf"
-        ;;
-    4)
-        check_configs_dir
-        run_sysctl_setup 4 "Remnawave панель" "$CONFIGS_DIR/panel.conf"
-        ;;
-    5)
-        check_configs_dir
-        run_sysctl_setup 5 "Telegram бот" "$CONFIGS_DIR/bot.conf"
-        ;;
-    6)
-        section "Установка Remnanode"
-        info "Запускаю установщик Remnanode..."
-        echo ""
-        bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh) @ install
-        ;;
-    7)
-        section "Установка Caddy Selfsteal"
-        info "Запускаю установщик Caddy Selfsteal..."
-        echo ""
-        bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install
-        ;;
-    8)
-        section "Установка WARP"
-        info "Запускаю установщик WARP..."
-        echo ""
-        bash <(curl -sL https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh) install-warp
-        ;;
-    *)
-        fail "Неверный выбор. Выход."
-        exit 1
-        ;;
-esac
+    section "Выбери действие"
+    echo "  Что нужно сделать?"
+    echo ""
+    echo -e "  ${BOLD}1)${NC} Базовая настройка VPS    — пользователь, SSH, UFW"
+    echo -e "  ${BOLD}2)${NC} Установка Fail2ban        — защита SSH от брутфорса"
+    echo -e "  ${BOLD}3)${NC} sysctl: VPN нода          — Xray VLESS REALITY XTLS Vision"
+    echo -e "  ${BOLD}4)${NC} sysctl: Remnawave панель  — Docker + Caddy + PostgreSQL"
+    echo -e "  ${BOLD}5)${NC} sysctl: Telegram бот      — Docker + веб страница + PostgreSQL"
+    echo -e "  ${BOLD}6)${NC} Установка Remnanode       — Xray нода для Remnawave"
+    echo -e "  ${BOLD}7)${NC} Установка Caddy Selfsteal — реверс-прокси для REALITY"
+    echo -e "  ${BOLD}8)${NC} Установка WARP            — Cloudflare WARP туннель"
+    echo ""
+    echo -e "  ${BOLD}0)${NC} Выход"
+    echo ""
+    read -rp "  Введи номер [0-8]: " CHOICE
+}
+
+while true; do
+    show_menu
+
+    case "$CHOICE" in
+        0)
+            info "Выход. До свидания!"
+            echo ""
+            exit 0
+            ;;
+        1)
+            run_initial_setup
+            ;;
+        2)
+            run_fail2ban_setup
+            ;;
+        3)
+            check_configs_dir
+            run_sysctl_setup 3 "VPN нода" "$CONFIGS_DIR/vpn-node.conf"
+            ;;
+        4)
+            check_configs_dir
+            run_sysctl_setup 4 "Remnawave панель" "$CONFIGS_DIR/panel.conf"
+            ;;
+        5)
+            check_configs_dir
+            run_sysctl_setup 5 "Telegram бот" "$CONFIGS_DIR/bot.conf"
+            ;;
+        6)
+            section "Установка Remnanode"
+            info "Запускаю установщик Remnanode..."
+            echo ""
+            bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh) @ install
+            ;;
+        7)
+            section "Установка Caddy Selfsteal"
+            info "Запускаю установщик Caddy Selfsteal..."
+            echo ""
+            bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install
+            ;;
+        8)
+            section "Установка WARP"
+            info "Запускаю установщик WARP..."
+            echo ""
+            bash <(curl -sL https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh) install-warp
+            ;;
+        *)
+            warn "Неверный выбор. Попробуй снова."
+            ;;
+    esac
+
+    echo ""
+    read -rp "  Нажми Enter чтобы вернуться в меню..."
+done
