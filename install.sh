@@ -51,8 +51,16 @@ check_configs_dir() {
 get_ssh_port() {
     local port=""
 
-    # Сначала проверяем наш drop-in
-    if [ -f /etc/ssh/sshd_config.d/99-hardened.conf ]; then
+    # Сначала берём эффективный порт у самого sshd, чтобы не ошибиться из-за порядка Include.
+    port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+
+    # Затем проверяем наш актуальный drop-in
+    if [ -z "$port" ] && [ -f /etc/ssh/sshd_config.d/00-hardened.conf ]; then
+        port=$(grep -i "^Port " /etc/ssh/sshd_config.d/00-hardened.conf 2>/dev/null | awk '{print $2}' | head -1)
+    fi
+
+    # Затем старый drop-in, если он остался после предыдущих версий скрипта
+    if [ -z "$port" ] && [ -f /etc/ssh/sshd_config.d/99-hardened.conf ]; then
         port=$(grep -i "^Port " /etc/ssh/sshd_config.d/99-hardened.conf 2>/dev/null | awk '{print $2}' | head -1)
     fi
 
@@ -145,8 +153,16 @@ run_initial_setup() {
         fi
     done
 
-    SSHD_DROP_IN="/etc/ssh/sshd_config.d/99-hardened.conf"
+    SSHD_DROP_IN="/etc/ssh/sshd_config.d/00-hardened.conf"
+    SSHD_CLOUD_INIT="/etc/ssh/sshd_config.d/50-cloud-init.conf"
     mkdir -p /etc/ssh/sshd_config.d
+
+    if [ -f "$SSHD_CLOUD_INIT" ] && grep -Eiq '^[[:space:]]*PasswordAuthentication[[:space:]]+yes\b' "$SSHD_CLOUD_INIT"; then
+        SSHD_CLOUD_INIT_BAK="${SSHD_CLOUD_INIT}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$SSHD_CLOUD_INIT" "$SSHD_CLOUD_INIT_BAK"
+        sed -Ei 's/^[[:space:]]*PasswordAuthentication[[:space:]]+yes\b/# PasswordAuthentication yes  # disabled by VPS Setup Tool/' "$SSHD_CLOUD_INIT"
+        ok "cloud-init SSH override отключён: $SSHD_CLOUD_INIT (бэкап: $SSHD_CLOUD_INIT_BAK)"
+    fi
 
     cat > "$SSHD_DROP_IN" << EOF
 # Hardened SSH config — создан VPS Setup Tool
@@ -169,6 +185,16 @@ EOF
         ok "sshd -t прошёл без ошибок"
     else
         fail "sshd -t обнаружил ошибки — проверь $SSHD_DROP_IN"
+        info "SSH НЕ перезапущен во избежание блокировки"
+        exit 1
+    fi
+
+    EFFECTIVE_PASSWORD_AUTH=$(sshd -T 2>/dev/null | awk 'tolower($1)=="passwordauthentication"{print tolower($2); exit}')
+    if [ "$EFFECTIVE_PASSWORD_AUTH" = "no" ]; then
+        ok "Эффективная настройка SSH: PasswordAuthentication no"
+    else
+        fail "Эффективная настройка SSH не стала PasswordAuthentication no"
+        info "Проверь ранние директивы PasswordAuthentication в /etc/ssh/sshd_config и /etc/ssh/sshd_config.d/*.conf"
         info "SSH НЕ перезапущен во избежание блокировки"
         exit 1
     fi
@@ -300,86 +326,61 @@ run_fail2ban_setup() {
 
     ok "Будет использован порт: ${BOLD}$DETECTED_PORT${NC}"
 
-    # ── Подготовка jail.local ────────────────────────────────
+    # ── Подготовка jail.d override ───────────────────────────
     section "Подготовка конфига"
 
-    JAIL_CONF="/etc/fail2ban/jail.conf"
-    JAIL_LOCAL="/etc/fail2ban/jail.local"
+    JAIL_DIR="/etc/fail2ban/jail.d"
+    JAIL_LOCAL="$JAIL_DIR/sshd.local"
 
-    if [ ! -f "$JAIL_CONF" ]; then
-        fail "Файл $JAIL_CONF не найден — установка повреждена?"
-        exit 1
-    fi
+    mkdir -p "$JAIL_DIR"
 
     if [ -f "$JAIL_LOCAL" ]; then
         JAIL_BAK="${JAIL_LOCAL}.bak.$(date +%Y%m%d_%H%M%S)"
         cp "$JAIL_LOCAL" "$JAIL_BAK"
-        ok "Существующий jail.local сохранён: $JAIL_BAK"
-    else
-        cp "$JAIL_CONF" "$JAIL_LOCAL"
-        ok "Создан jail.local из jail.conf"
+        ok "Существующий sshd.local сохранён: $JAIL_BAK"
     fi
 
-    # ── Патчим секцию [sshd] ─────────────────────────────────
+    if command -v journalctl &>/dev/null && [ -d /run/systemd/system ]; then
+        F2B_BACKEND="systemd"
+        F2B_LOGPATH=""
+    else
+        F2B_BACKEND="auto"
+        F2B_LOGPATH="logpath  = /var/log/auth.log"
+    fi
+
+    # ── Пишем секцию [sshd] ──────────────────────────────────
     section "Настройка jail [sshd]"
 
-    python3 - "$JAIL_LOCAL" "$DETECTED_PORT" << 'PYEOF'
-import sys, re
+    cat > "$JAIL_LOCAL" << EOF
+[sshd]
+enabled  = true
+port     = $DETECTED_PORT
+filter   = sshd
+maxretry = 3
+bantime  = 3600
+findtime = 600
+backend  = $F2B_BACKEND
+$F2B_LOGPATH
+EOF
 
-jail_file = sys.argv[1]
-ssh_port  = sys.argv[2]
-
-with open(jail_file, 'r') as f:
-    content = f.read()
-
-new_sshd = (
-    "[sshd]\n"
-    "enabled  = true\n"
-    f"port     = {ssh_port}\n"
-    "filter   = sshd\n"
-    "logpath  = /var/log/auth.log\n"
-    "maxretry = 3\n"
-    "bantime  = 3600\n"
-    "findtime = 600\n"
-    "backend  = %(sshd_backend)s\n"
-)
-
-# Заменяем существующую секцию [sshd] или добавляем в конец
-pattern = r'\[sshd\].*?(?=\n\[|\Z)'
-if re.search(pattern, content, re.DOTALL):
-    content = re.sub(pattern, new_sshd.rstrip(), content, flags=re.DOTALL)
-else:
-    content += "\n" + new_sshd
-
-with open(jail_file, 'w') as f:
-    f.write(content)
-
-print("  Секция [sshd] успешно обновлена")
-PYEOF
-
-    if [ $? -ne 0 ]; then
-        fail "Ошибка при обновлении jail.local"
-        exit 1
-    fi
+    ok "Секция [sshd] записана: $JAIL_LOCAL"
 
     # Показываем итоговую секцию
     echo ""
-    info "Итоговая секция [sshd] в jail.local:"
+    info "Итоговая секция [sshd] в $JAIL_LOCAL:"
     echo ""
-    python3 -c "
-import re
-with open('$JAIL_LOCAL') as f: c = f.read()
-m = re.search(r'\[sshd\].*?(?=\n\[|\Z)', c, re.DOTALL)
-if m:
-    for line in m.group().splitlines()[:10]:
-        print('    ' + line)
-"
+    sed 's/^/    /' "$JAIL_LOCAL"
     echo ""
 
     # ── Запуск и включение ───────────────────────────────────
     section "Запуск Fail2ban"
 
     systemctl enable fail2ban > /dev/null 2>&1
+    if ! fail2ban-client -t; then
+        fail "Fail2ban конфиг не прошёл проверку — сервис не перезапущен"
+        exit 1
+    fi
+
     systemctl restart fail2ban
 
     sleep 2
@@ -628,13 +629,14 @@ show_menu() {
     echo -e "  ${BOLD}3)${NC} sysctl: VPN нода          — Xray VLESS REALITY XTLS Vision"
     echo -e "  ${BOLD}4)${NC} sysctl: Remnawave панель  — Docker + Caddy + PostgreSQL"
     echo -e "  ${BOLD}5)${NC} sysctl: Telegram бот      — Docker + веб страница + PostgreSQL"
-    echo -e "  ${BOLD}6)${NC} Установка Remnanode       — Xray нода для Remnawave"
-    echo -e "  ${BOLD}7)${NC} Установка Caddy Selfsteal — реверс-прокси для REALITY"
-    echo -e "  ${BOLD}8)${NC} Установка WARP            — Cloudflare WARP туннель"
+    echo -e "  ${BOLD}6)${NC} Установка TrafficGuard    — защита и мониторинг трафика"
+    echo -e "  ${BOLD}7)${NC} Установка Remnanode       — Xray нода для Remnawave"
+    echo -e "  ${BOLD}8)${NC} Установка Caddy Selfsteal — реверс-прокси для REALITY"
+    echo -e "  ${BOLD}9)${NC} Установка WARP            — Cloudflare WARP туннель"
     echo ""
     echo -e "  ${BOLD}0)${NC} Выход"
     echo ""
-    read -rp "  Введи номер [0-8]: " CHOICE
+    read -rp "  Введи номер [0-9]: " CHOICE
 }
 
 while true; do
@@ -665,18 +667,24 @@ while true; do
             run_sysctl_setup 5 "Telegram бот" "$CONFIGS_DIR/bot.conf"
             ;;
         6)
+            section "Установка TrafficGuard"
+            info "Запускаю установщик TrafficGuard..."
+            echo ""
+            curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh | bash
+            ;;
+        7)
             section "Установка Remnanode"
             info "Запускаю установщик Remnanode..."
             echo ""
             bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh) @ install
             ;;
-        7)
+        8)
             section "Установка Caddy Selfsteal"
             info "Запускаю установщик Caddy Selfsteal..."
             echo ""
-            bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install
+            bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ --nginx install
             ;;
-        8)
+        9)
             section "Установка WARP"
             info "Запускаю установщик WARP..."
             echo ""
