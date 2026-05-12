@@ -17,11 +17,37 @@ CONFIGS_DIR="$SCRIPT_DIR/configs"
 SYSCTL_FILE="/etc/sysctl.d/99-custom.conf"
 BACKUP_FILE="/etc/sysctl.d/99-custom.conf.bak"
 
+set -o pipefail
+
 ok()      { echo -e "  ${GREEN}✓${NC}  $1"; }
 warn()    { echo -e "  ${YELLOW}⚠${NC}  $1"; }
 fail()    { echo -e "  ${RED}✗${NC}  $1"; }
 info()    { echo -e "  ${CYAN}→${NC}  $1"; }
 section() { echo -e "\n${BOLD}${BLUE}══ $1 ══${NC}\n"; }
+
+run_remote_installer() {
+    local url="$1"
+    shift
+    local tmp_file
+
+    tmp_file=$(mktemp)
+    if ! curl -fsSL "$url" -o "$tmp_file"; then
+        rm -f "$tmp_file"
+        fail "Не удалось скачать установщик: $url"
+        return 1
+    fi
+
+    if [ ! -s "$tmp_file" ]; then
+        rm -f "$tmp_file"
+        fail "Скачанный установщик пустой: $url"
+        return 1
+    fi
+
+    bash "$tmp_file" "$@"
+    local rc=$?
+    rm -f "$tmp_file"
+    return "$rc"
+}
 
 # --- Root проверка ---
 if [ "$EUID" -ne 0 ]; then
@@ -144,6 +170,9 @@ run_initial_setup() {
     # ── SSH конфиг ───────────────────────────────────────────
     section "Настройка SSH"
 
+    CURRENT_SSH_PORT=$(get_ssh_port)
+    info "Текущий SSH порт: ${BOLD}$CURRENT_SSH_PORT${NC}"
+
     while true; do
         read -rp "  Порт SSH (рекомендуется 1024–65535, не 22): " SSH_PORT
         if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
@@ -221,6 +250,11 @@ EOF
     ufw allow "$SSH_PORT"/tcp > /dev/null
     ok "Открыт SSH порт $SSH_PORT/tcp"
 
+    if [ "$CURRENT_SSH_PORT" != "$SSH_PORT" ]; then
+        ufw allow "$CURRENT_SSH_PORT"/tcp > /dev/null
+        warn "Старый SSH порт $CURRENT_SSH_PORT/tcp временно оставлен открытым для безопасной миграции"
+    fi
+
     echo ""
     read -rp "  Это VPN нода? Нужно открыть порт от панели? [y/N]: " IS_NODE
     if [[ "$IS_NODE" =~ ^[Yy]$ ]]; then
@@ -246,20 +280,30 @@ EOF
         ok "Разрешён входящий трафик с $PANEL_IP на порт $PANEL_PORT"
     fi
 
+    # ── Перезапуск SSH ───────────────────────────────────────
+    section "Перезапуск SSH"
+    if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
+        ok "SSH успешно перезапущен"
+    else
+        fail "Не удалось перезапустить SSH — сделай вручную: systemctl restart ssh"
+        info "UFW не включён/не перезагружен после изменения SSH, чтобы не закрыть рабочий доступ"
+        exit 1
+    fi
+
+    if command -v ss &>/dev/null; then
+        if ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$SSH_PORT$"; then
+            ok "SSH слушает новый порт $SSH_PORT"
+        else
+            warn "Не вижу SSH на порту $SSH_PORT через ss — проверь вручную перед закрытием root-сессии"
+        fi
+    fi
+
     ufw reload > /dev/null
     echo "y" | ufw enable > /dev/null
     ok "UFW включён и перезагружен"
 
     echo ""
     ufw status numbered
-
-    # ── Перезапуск SSH ───────────────────────────────────────
-    section "Перезапуск SSH"
-    if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
-        ok "SSH успешно перезапущен"
-    else
-        fail "Не удалось перезапустить SSH — сделай вручную: systemctl restart ssh"
-    fi
 
     # ── Итог ─────────────────────────────────────────────────
     section "Готово"
@@ -273,6 +317,11 @@ EOF
     echo ""
     info "Откат SSH:"
     echo "    rm $SSHD_DROP_IN && systemctl restart ssh"
+    if [ "$CURRENT_SSH_PORT" != "$SSH_PORT" ]; then
+        echo ""
+        info "После проверки нового входа можно закрыть старый SSH порт:"
+        echo "    ufw delete allow $CURRENT_SSH_PORT/tcp"
+    fi
     echo ""
 }
 
@@ -451,10 +500,14 @@ run_sysctl_setup() {
         ERRORS=$((ERRORS+1))
     fi
 
-    if modinfo tcp_bbr &>/dev/null 2>&1; then
-        ok "Модуль tcp_bbr доступен"
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        ok "BBR доступен в net.ipv4.tcp_available_congestion_control"
     else
-        fail "Модуль tcp_bbr не найден — BBR не будет работать"
+        fail "BBR не найден в net.ipv4.tcp_available_congestion_control — BBR не будет работать"
         ERRORS=$((ERRORS+1))
     fi
 
@@ -537,6 +590,7 @@ run_sysctl_setup() {
     section "Бэкап и установка"
 
     if [ -f "$SYSCTL_FILE" ]; then
+        BACKUP_FILE="${SYSCTL_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
         cp "$SYSCTL_FILE" "$BACKUP_FILE"
         ok "Бэкап сохранён: $BACKUP_FILE"
     fi
@@ -631,7 +685,7 @@ show_menu() {
     echo -e "  ${BOLD}5)${NC} sysctl: Telegram бот      — Docker + веб страница + PostgreSQL"
     echo -e "  ${BOLD}6)${NC} Установка TrafficGuard    — защита и мониторинг трафика"
     echo -e "  ${BOLD}7)${NC} Установка Remnanode       — Xray нода для Remnawave"
-    echo -e "  ${BOLD}8)${NC} Установка Caddy Selfsteal — реверс-прокси для REALITY"
+    echo -e "  ${BOLD}8)${NC} Установка Nginx Selfsteal — реверс-прокси для REALITY"
     echo -e "  ${BOLD}9)${NC} Установка WARP            — Cloudflare WARP туннель"
     echo ""
     echo -e "  ${BOLD}0)${NC} Выход"
@@ -670,25 +724,29 @@ while true; do
             section "Установка TrafficGuard"
             info "Запускаю установщик TrafficGuard..."
             echo ""
-            curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh | bash
+            run_remote_installer "https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh" \
+                || fail "Установщик TrafficGuard завершился с ошибкой"
             ;;
         7)
             section "Установка Remnanode"
             info "Запускаю установщик Remnanode..."
             echo ""
-            bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh) @ install
+            run_remote_installer "https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh" @ install \
+                || fail "Установщик Remnanode завершился с ошибкой"
             ;;
         8)
-            section "Установка Caddy Selfsteal"
-            info "Запускаю установщик Caddy Selfsteal..."
+            section "Установка Nginx Selfsteal"
+            info "Запускаю установщик Nginx Selfsteal..."
             echo ""
-            bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ --nginx install
+            run_remote_installer "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh" @ --nginx install \
+                || fail "Установщик Nginx Selfsteal завершился с ошибкой"
             ;;
         9)
             section "Установка WARP"
             info "Запускаю установщик WARP..."
             echo ""
-            bash <(curl -sL https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh) install-warp
+            run_remote_installer "https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh" install-warp \
+                || fail "Установщик WARP завершился с ошибкой"
             ;;
         *)
             warn "Неверный выбор. Попробуй снова."
