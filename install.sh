@@ -663,6 +663,46 @@ run_sysctl_setup() {
 }
 
 # =============================================================
+# Функция: Блокировка DIRECT соединений Tailscale
+# =============================================================
+run_tailscale_nodirect_setup() {
+    local nft_dir="/etc/nftables.d"
+    local nft_file="$nft_dir/ts-nodirect.nft"
+
+    section "Блокировка DIRECT соединений Tailscale"
+
+    if ! command -v nft &>/dev/null; then
+        fail "nft не найден. Установи пакет nftables и повтори запуск."
+        return 1
+    fi
+
+    info "Создаю каталог $nft_dir..."
+    mkdir -p "$nft_dir" || {
+        fail "Не удалось создать каталог $nft_dir"
+        return 1
+    }
+
+    info "Записываю правило в $nft_file..."
+    cat > "$nft_file" <<'EOF'
+table inet ts_nodirect {
+    chain output {
+        type filter hook output priority -150; policy accept;
+        udp sport 41641 counter drop
+    }
+}
+EOF
+
+    info "Применяю nftables правило..."
+    nft delete table inet ts_nodirect 2>/dev/null || true
+    if nft -f "$nft_file"; then
+        ok "DIRECT соединения Tailscale заблокированы правилом nftables"
+    else
+        fail "Не удалось применить $nft_file"
+        return 1
+    fi
+}
+
+# =============================================================
 # Главное меню
 # =============================================================
 
@@ -687,10 +727,11 @@ show_menu() {
     echo -e "  ${BOLD}7)${NC} Установка Remnanode       — Xray нода для Remnawave"
     echo -e "  ${BOLD}8)${NC} Установка Nginx Selfsteal — реверс-прокси для REALITY"
     echo -e "  ${BOLD}9)${NC} Установка WARP            — Cloudflare WARP туннель"
+    echo -e "  ${BOLD}10)${NC} Tailscale NoDirect       — блокировка DIRECT UDP 41641"
     echo ""
     echo -e "  ${BOLD}0)${NC} Выход"
     echo ""
-    read -rp "  Введи номер [0-9]: " CHOICE
+    read -rp "  Введи номер [0-10]: " CHOICE
 }
 
 while true; do
@@ -747,6 +788,9 @@ while true; do
             echo ""
             run_remote_installer "https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh" install-warp \
                 || fail "Установщик WARP завершился с ошибкой"
+            ;;
+        10)
+            run_tailscale_nodirect_setup
             ;;
         *)
             warn "Неверный выбор. Попробуй снова."
