@@ -668,11 +668,17 @@ run_sysctl_setup() {
 run_tailscale_nodirect_setup() {
     local nft_dir="/etc/nftables.d"
     local nft_file="$nft_dir/ts-nodirect.nft"
+    local service_file="/etc/systemd/system/ts-nodirect.service"
 
     section "Блокировка DIRECT соединений Tailscale"
 
     if ! command -v nft &>/dev/null; then
         fail "nft не найден. Установи пакет nftables и повтори запуск."
+        return 1
+    fi
+
+    if ! command -v systemctl &>/dev/null; then
+        fail "systemctl не найден. Не удалось настроить автозапуск правила."
         return 1
     fi
 
@@ -692,14 +698,47 @@ table inet ts_nodirect {
 }
 EOF
 
-    info "Применяю nftables правило..."
+    info "Создаю systemd service $service_file..."
+    cat > "$service_file" <<EOF
+[Unit]
+Description=Disable Tailscale direct transport
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f $nft_file
+ExecStop=/usr/sbin/nft delete table inet ts_nodirect
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    info "Перезагружаю systemd и включаю ts-nodirect.service..."
+    systemctl daemon-reload || {
+        fail "Не удалось выполнить systemctl daemon-reload"
+        return 1
+    }
+
+    systemctl reset-failed ts-nodirect.service 2>/dev/null || true
+    systemctl stop ts-nodirect.service 2>/dev/null || true
     nft delete table inet ts_nodirect 2>/dev/null || true
-    if nft -f "$nft_file"; then
-        ok "DIRECT соединения Tailscale заблокированы правилом nftables"
+
+    if systemctl enable --now ts-nodirect.service; then
+        ok "DIRECT соединения Tailscale заблокированы и включены при загрузке"
     else
-        fail "Не удалось применить $nft_file"
+        fail "Не удалось включить ts-nodirect.service"
         return 1
     fi
+
+    echo ""
+    info "Статус ts-nodirect.service:"
+    systemctl --no-pager --full status ts-nodirect.service || true
+
+    echo ""
+    info "Текущая таблица nftables:"
+    nft list table inet ts_nodirect || true
 }
 
 # =============================================================
